@@ -16,6 +16,10 @@ type filesystemDataManager struct {
 	dataPath string
 }
 
+func newFilesystemDataManager(dataPath string) *filesystemDataManager {
+	return &filesystemDataManager{dataPath: dataPath}
+}
+
 func (m *filesystemDataManager) objectPath(objectKey string) string {
 	return filepath.Join(m.dataPath, objectKey)
 }
@@ -33,9 +37,14 @@ func (m *filesystemDataManager) ListObjectProps(objectKey string) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	result := make([]string, len(files))
-	for i, f := range files {
-		result[i] = f.Name()
+	result := make([]string, 0, len(files))
+	for _, f := range files {
+		// The safe-slot directory is internal storage and must never
+		// leak into the user-visible property list.
+		if f.IsDir() && f.Name() == slotDirName {
+			continue
+		}
+		result = append(result, f.Name())
 	}
 	return result, nil
 }

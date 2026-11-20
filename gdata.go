@@ -2,12 +2,14 @@ package gdata
 
 import (
 	"errors"
+	"fmt"
 )
 
 // Manager implements the main gamedata operations.
 // You can create a new manager by using Open function.
 type Manager struct {
-	impl dataManagerImpl
+	impl  dataManagerImpl
+	slots *slotEngine
 }
 
 // dataManagerImpl is an interface every platform-specific storage provider implements.
@@ -54,6 +56,20 @@ type Config struct {
 	//
 	// It's ignored on environments like JS/wasm.
 	Root string
+
+	// Slots enables the crash-safe save slots and sets how many complete
+	// saves per object property are retained.
+	//
+	// A zero value (the default) keeps the legacy single-file behavior
+	// unchanged and disables the slot-aware API (it returns ErrSlotsDisabled).
+	// A positive value between 1 and MaxSlots keeps that many recent
+	// complete saves. Every save is written into a new validated slot and
+	// atomically promoted, so an interrupted write can never corrupt the
+	// previously committed save.
+	//
+	// The behavior is identical on desktop, Android and browser targets;
+	// only the underlying storage primitives differ.
+	Slots int
 }
 
 // Open attempts to create a gamedata manager.
@@ -70,11 +86,24 @@ func Open(config Config) (*Manager, error) {
 	if config.AppName == "" {
 		return nil, errors.New("config.AppName can't be empty")
 	}
-	m, err := newDataManager(config)
+	if config.Slots < 0 {
+		return nil, errors.New("config.Slots can't be negative")
+	}
+	if config.Slots > MaxSlots {
+		return nil, fmt.Errorf("config.Slots can't exceed %d", MaxSlots)
+	}
+	m, store, err := newDataManager(config)
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{impl: m}, nil
+	manager := &Manager{impl: m}
+	if config.Slots > 0 {
+		manager.slots = &slotEngine{
+			store:     store,
+			slotCount: config.Slots,
+		}
+	}
+	return manager, nil
 }
 
 // ListObjectProps returns all object property keys.
@@ -156,6 +185,16 @@ func (m *Manager) ObjectPropExists(objectKey, propKey string) bool {
 //
 // The returned error is usually a file operation error.
 func (m *Manager) DeleteObject(objectKey string) error {
+	if m.slots != nil {
+		// Keep the slot area consistent with the legacy object folder.
+		// A cleanup failure is reported but does not prevent the legacy
+		// removal below; orphaned slots are harmless and can be pruned later.
+		if err := m.slots.DeleteObject(objectKey); err != nil && !errors.Is(err, ErrInvalidKey) {
+			return err
+		}
+	}
+	// Since RemoveAll returns a nil error for a non-existing
+	// path, we can avoid doing an explicit fileExists call.
 	return m.impl.DeleteObject(objectKey)
 }
 
@@ -175,7 +214,13 @@ func (m *Manager) DeleteObject(objectKey string) error {
 //
 // The returned error is usually a file operation error.
 func (m *Manager) DeleteObjectProp(objectKey, propKey string) error {
-	return m.impl.DeleteObjectProp(objectKey, fixPropKey(propKey))
+	propKey = fixPropKey(propKey)
+	if m.slots != nil {
+		if err := m.slots.DeleteScope(objectKey, propKey); err != nil && !errors.Is(err, ErrInvalidKey) {
+			return err
+		}
+	}
+	return m.impl.DeleteObjectProp(objectKey, propKey)
 }
 
 // ObjectPropPath returns a unique object property path.
@@ -194,6 +239,58 @@ func (m *Manager) DeleteObjectProp(objectKey, propKey string) error {
 // objectKey is used.
 func (m *Manager) ObjectPropPath(objectKey, propKey string) string {
 	return m.impl.ObjectPropPath(objectKey, fixPropKey(propKey))
+}
+
+// SaveSlot writes data into a new safe-save slot and atomically promotes
+// it to the most recent complete save. The version string is stored as
+// slot metadata alongside the data and is returned by ListSlots and
+// LoadLatestSlot; pass "" when no version metadata is needed.
+//
+// The previous complete saves remain untouched until the new manifest is
+// committed, so a power loss or a full disk during the write leaves the
+// last good save readable. At most Config.Slots recent saves are kept;
+// older ones are pruned after a successful commit.
+//
+// Possible errors: ErrSlotsDisabled (slots not configured), ErrInvalidKey
+// (slot-name traversal attempt), ErrNoSpace, ErrBusy (another save is in
+// progress) or the underlying storage error.
+func (m *Manager) SaveSlot(objectKey, propKey, version string, data []byte) error {
+	if m.slots == nil {
+		return ErrSlotsDisabled
+	}
+	return m.slots.Save(objectKey, fixPropKey(propKey), version, data)
+}
+
+// LoadLatestSlot reads and validates the most recent complete save.
+//
+// If the newest slot is corrupted, older slots are tried automatically
+// until a valid one is found. ErrNoSlots is returned when no complete
+// save exists or none of them passes validation.
+func (m *Manager) LoadLatestSlot(objectKey, propKey string) ([]byte, SlotInfo, error) {
+	if m.slots == nil {
+		return nil, SlotInfo{}, ErrSlotsDisabled
+	}
+	return m.slots.LoadLatest(objectKey, fixPropKey(propKey))
+}
+
+// LoadSlotVersion loads a specific historical save identified by its
+// sequence number (as reported by ListSlots). This is the explicit
+// version-selection / rollback entry point.
+func (m *Manager) LoadSlotVersion(objectKey, propKey string, seq uint64) ([]byte, SlotInfo, error) {
+	if m.slots == nil {
+		return nil, SlotInfo{}, ErrSlotsDisabled
+	}
+	return m.slots.LoadVersion(objectKey, fixPropKey(propKey), seq)
+}
+
+// ListSlots returns metadata of all complete slots, newest first.
+// Use it together with LoadSlotVersion to let the player pick an older
+// save to roll back to.
+func (m *Manager) ListSlots(objectKey, propKey string) ([]SlotInfo, error) {
+	if m.slots == nil {
+		return nil, ErrSlotsDisabled
+	}
+	return m.slots.List(objectKey, fixPropKey(propKey))
 }
 
 func fixPropKey(propKey string) string {

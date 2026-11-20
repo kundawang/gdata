@@ -8,19 +8,17 @@ import (
 	"path/filepath"
 )
 
-func newDataManager(config Config) (dataManagerImpl, error) {
+func newDataManager(config Config) (dataManagerImpl, slotStore, error) {
 	app, err := detectAndroidApp()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	dataPath := filepath.Join("/data/data/", app)
 	if !fileExists(dataPath) {
-		return nil, errors.New("can't find the app data directory")
+		return nil, nil, errors.New("can't find the app data directory")
 	}
-	m := &filesystemDataManager{
-		dataPath: dataPath,
-	}
-	return m, nil
+	m := newFilesystemDataManager(dataPath)
+	return m, m, nil
 }
 
 func detectAndroidApp() (string, error) {
